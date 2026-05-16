@@ -1,8 +1,23 @@
-"""Sub-page chunking.
+"""Document-level chunking.
 
-Packs a page's structured blocks into chunk-shaped strings the embedder
-consumes, threading section titles and source bboxes through so the
+Packs the document's structured blocks (across every page, in global
+reading order) into chunk-shaped strings the embedder consumes,
+threading section titles and per-bbox source pages through so the
 retrieval layer can produce citation-friendly results.
+
+Why document-level (not per-page)
+==================================
+Pages are a typesetter's layout artifact, not a semantic boundary.
+Per-page chunking forced a `flush()` at every page break, which:
+  • split lists / paragraphs / sections that wrapped across a page;
+  • left orphan one-line chunks when a heading landed at the bottom of
+    a page and its body started on the next;
+  • dropped section_title context for chunks whose parent heading lived
+    on a previous page.
+Walking the whole document in one pass fixes all three. Each chunk's
+`page_number` is the page of its FIRST contributing block (the
+"primary" citation page), and the `bboxes` list carries `{"page", "bbox"}`
+entries so multi-page chunks still cite every source region.
 """
 from __future__ import annotations
 
@@ -76,20 +91,28 @@ def chunk_blocks(blocks: list[dict]) -> list[str]:
 def chunk_blocks_with_meta(blocks: list[dict]) -> list[dict]:
     """Pack blocks into chunks and return per-chunk metadata.
 
-    Each block dict may carry `type`, `content`, `reading_order`, and
-    (optionally) `bbox` — when bbox is present it's threaded onto every
-    chunk that consumed (any portion of) that block, so the retrieval
-    layer can render citations like "page 5, top-right".
+    Each block dict may carry `type`, `content`, `reading_order`, `bbox`,
+    and `page_number`. The caller is expected to provide blocks in
+    global reading order with a monotonic `reading_order` across the
+    whole document — see [ingest.py](../pipeline/ingest.py) for how
+    that's built.
 
-    Each returned dict is `{content, block_types, section_title, bboxes}`.
-    `bboxes` is a list of (x_min, y_min, x_max, y_max) tuples — one per
-    contributing block — and is empty when the input blocks had no bbox
-    field (e.g. legacy callers).
+    Each returned dict is
+    `{content, block_types, section_title, page_number, bboxes}`:
+      • `page_number` is the page of the chunk's FIRST contributing
+        block (the "primary" citation page; multi-page chunks may pull
+        bboxes from later pages too).
+      • `bboxes` is a list of `{"page": int|None, "bbox": [x_min, y_min,
+        x_max, y_max]}` dicts — one per contributing block — and is
+        empty when the input blocks had no bbox field.
     """
     if not blocks:
         return []
 
     # Sort by reading_order so multi-column or RTL layouts stay coherent.
+    # When the caller is ingest.py, reading_order is already globally
+    # monotonic across pages, so this is effectively a no-op stabiliser
+    # rather than a true reorder.
     sorted_blocks = sorted(
         (b for b in blocks if (b.get("content") or "").strip()),
         key=lambda b: int(b.get("reading_order") or 0),
@@ -100,22 +123,33 @@ def chunk_blocks_with_meta(blocks: list[dict]) -> list[dict]:
     chunks: list[dict] = []
     current_text = ""
     current_types: list[str] = []
-    current_bboxes: list[tuple[float, float, float, float]] = []
+    current_bboxes: list[dict] = []
     current_section = ""
+    current_page: int | None = None   # primary page = first block's page
     last_section = ""  # heading-as-section for chunks AFTER the heading too
 
     def flush() -> None:
-        nonlocal current_text, current_types, current_bboxes
+        nonlocal current_text, current_types, current_bboxes, current_page
         if current_text.strip():
             chunks.append({
                 "content":       current_text.strip(),
                 "block_types":   list(current_types),
                 "section_title": current_section,
+                "page_number":   current_page,
                 "bboxes":        list(current_bboxes),
             })
         current_text = ""
         current_types = []
         current_bboxes = []
+        current_page = None
+
+    def _bbox_entry(bbox, page) -> dict | None:
+        """Wrap a 4-tuple bbox + its source page into the storage shape.
+        Returns None when bbox is None so callers can `if entry:` without
+        emitting `{"page": …, "bbox": None}` dicts."""
+        if not bbox:
+            return None
+        return {"page": page, "bbox": list(bbox)}
 
     for block in sorted_blocks:
         btype = block.get("type") or "text"
@@ -123,6 +157,8 @@ def chunk_blocks_with_meta(blocks: list[dict]) -> list[dict]:
         if not text:
             continue
         bbox = _coerce_bbox(block.get("bbox"))
+        page = block.get("page_number")
+        bbox_entry = _bbox_entry(bbox, page)
 
         # Atomic blocks: emit any pending chunk, then emit this block as
         # its own chunk regardless of size. Splitting a table mid-row or
@@ -133,18 +169,40 @@ def chunk_blocks_with_meta(blocks: list[dict]) -> list[dict]:
                 "content":       text,
                 "block_types":   [btype],
                 "section_title": last_section,
-                "bboxes":        [bbox] if bbox else [],
+                "page_number":   page,
+                "bboxes":        [bbox_entry] if bbox_entry else [],
             })
             continue
 
         # Headings start a new chunk and become the running section title.
+        #
+        # Exception: when the pending chunk is heading-only (no body has
+        # been appended yet), fold the new heading into it instead of
+        # flushing. Kills the one-line chunks that used to happen at
+        # consecutive-heading transitions like
+        # "Program Curriculum" → "1. Session 1: …", AND now (since
+        # chunking is document-level) handles the cross-page variant
+        # where the parent heading sits at the end of page N and the
+        # subheading + body starts on page N+1.
         if btype == "heading":
-            flush()
-            last_section = text[:300]
-            current_section = last_section
-            current_text = text
-            current_types = ["heading"]
-            current_bboxes = [bbox] if bbox else []
+            if current_types == ["heading"] and current_text.strip():
+                merged_text = current_text.strip() + " — " + text
+                last_section = merged_text[:300]
+                current_section = last_section
+                current_text = merged_text
+                # current_types stays ["heading"]; current_page stays the
+                # FIRST heading's page (don't move forward — the chunk
+                # logically starts where the parent heading appears).
+                if bbox_entry:
+                    current_bboxes.append(bbox_entry)
+            else:
+                flush()
+                last_section = text[:300]
+                current_section = last_section
+                current_text = text
+                current_types = ["heading"]
+                current_bboxes = [bbox_entry] if bbox_entry else []
+                current_page = page
             continue
 
         # Plain text / footer block. If it alone exceeds the chunk size,
@@ -161,7 +219,8 @@ def chunk_blocks_with_meta(blocks: list[dict]) -> list[dict]:
                     "content":       piece,
                     "block_types":   [btype],
                     "section_title": last_section,
-                    "bboxes":        [bbox] if bbox else [],
+                    "page_number":   page,
+                    "bboxes":        [bbox_entry] if bbox_entry else [],
                 })
             continue
 
@@ -171,16 +230,19 @@ def chunk_blocks_with_meta(blocks: list[dict]) -> list[dict]:
         if len(joined) <= DEFAULT_CHUNK_CHARS:
             current_text = joined
             current_types.append(btype)
-            if bbox:
-                current_bboxes.append(bbox)
+            if bbox_entry:
+                current_bboxes.append(bbox_entry)
             if not current_section:
                 current_section = last_section
+            if current_page is None:
+                current_page = page
         else:
             flush()
             current_text = text
             current_types = [btype]
-            current_bboxes = [bbox] if bbox else []
+            current_bboxes = [bbox_entry] if bbox_entry else []
             current_section = last_section
+            current_page = page
 
     flush()
     return chunks

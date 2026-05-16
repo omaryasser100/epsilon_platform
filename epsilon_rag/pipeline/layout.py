@@ -8,7 +8,7 @@ Docling is the spine of this pipeline. A single `convert()` call gives us:
 
 We do NOT use Docling for OCR — its built-in OCR backend is slower and
 doesn't have an Arabic-tuned model. We post-process Docling's output
-and run Surya OCR in `pipeline.ocr` on regions that came back empty.
+and run RapidOCR in `pipeline.ocr` on regions that came back empty.
 
 Two entry points
 ================

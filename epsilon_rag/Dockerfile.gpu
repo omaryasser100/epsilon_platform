@@ -2,7 +2,7 @@
 #
 # Stack:
 #   • Docling             — layout, reading order, tables (TableFormer)
-#   • Surya OCR           — Arabic + English text recognition
+#   • RapidOCR (PP-OCRv3) — Arabic + English text recognition, ONNX
 #   • BAAI/bge-m3         — multilingual chunk embeddings (1024-dim)
 #   • BAAI/bge-reranker-v2-m3 — cross-encoder reranker
 #
@@ -70,16 +70,20 @@ WORKDIR /app
 # not network I/O. snapshot_download fetches files only; the actual model
 # init (which needs a real CUDA driver) happens when main.py runs.
 #
-# Surya OCR pulls from HF cache too (HF_HOME), so the same `snapshot_download`
-# trick works — no separate cache directory like EasyOCR used. The repo IDs
-# below match what Surya's DetectionPredictor / RecognitionPredictor load
-# by default; pin them via SURYA_DETECTOR_MODEL / SURYA_RECOGNITION_MODEL
-# at runtime if you need a different version.
+# RapidOCR pulls its ONNX weights from HF cache (HF_HOME) too, via the
+# same `huggingface_hub` plumbing. We use `allow_patterns` to grab only
+# the Arabic PP-OCRv3 files pipeline/ocr.py actually loads — the full
+# SWHL/RapidOCR repo carries every PP-OCR language variant and we don't
+# want the entire ~1 GB of unused weights in the image.
 RUN python -c "from huggingface_hub import snapshot_download; \
     snapshot_download(repo_id='BAAI/bge-m3'); \
     snapshot_download(repo_id='BAAI/bge-reranker-v2-m3'); \
-    snapshot_download(repo_id='vikp/surya_det3'); \
-    snapshot_download(repo_id='vikp/surya_rec2')"
+    snapshot_download(repo_id='SWHL/RapidOCR', allow_patterns=[ \
+        'PP-OCRv3/multilingual/Multilingual_PP-OCRv3_det_infer.onnx', \
+        'PP-OCRv3/multilingual/arabic_PP-OCRv3_rec_infer.onnx', \
+        'PP-OCRv3/multilingual/arabic_dict.txt', \
+        'PP-OCRv3/ch_ppocr_mobile_v2.0_cls_infer.onnx', \
+    ])"
 
 COPY . .
 

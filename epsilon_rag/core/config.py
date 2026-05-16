@@ -82,11 +82,28 @@ class Settings(BaseSettings):
     formulas_max_tokens: int = 384        # long enough for multi-line equations
     formulas_beams: int = 1               # greedy by default; raise for accuracy at ~2× latency
 
-    # Surya OCR language hints — CSV. 'ar,en' covers Arabic + English.
-    # Adding a language is just an env var change (no image rebuild)
-    # because Surya's recognition model is multilingual; the codes
-    # here gate script-routing behaviour, not separate model downloads.
-    ocr_languages: str = "ar,en"
+    # RapidOCR (PP-OCRv3) model paths. Empty = let pipeline/ocr.py fetch
+    # the canonical Arabic + multilingual-detector ONNX files from the
+    # SWHL/RapidOCR Hugging Face repo into HF_HOME on first init. Override
+    # any of these to point at a local file when running fully air-gapped
+    # or to swap in a different language's recognition model (e.g. Latin-
+    # only for English-heavy corpora — `latin_PP-OCRv3_rec_infer.onnx`).
+    ocr_det_model_path: str = ""
+    ocr_rec_model_path: str = ""
+    ocr_rec_keys_path:  str = ""
+    ocr_cls_model_path: str = ""
+
+    # GPU toggle for RapidOCR's ONNX sessions. The CUDAExecutionProvider
+    # is enabled when True AND onnxruntime-gpu is installed; otherwise
+    # the engine silently falls back to CPU.
+    ocr_use_cuda: bool = True
+
+    # Drop OCR lines whose recognition confidence is below this. PP-OCRv3
+    # confidences are well-calibrated: real text scores 0.9+, hallucinated
+    # lines on non-text crops typically score 0.3-0.5. 0.5 is the sweet
+    # spot — kills the hallucinations from decorative figure regions
+    # without losing low-contrast scanned text.
+    ocr_min_confidence: float = 0.5
 
     # Multilingual sentence-transformer for /v1/embed.
     # BAAI/bge-m3 — 1024 dims, ~2.5 GB VRAM, top-of-class on Arabic retrieval
@@ -106,7 +123,7 @@ class Settings(BaseSettings):
     # Cross-encoder reranker for /v1/rerank. Trained as a sibling to bge-m3
     # so query and chunk vectors live in compatible representation spaces;
     # joint scoring is meaningfully better than re-scoring with cosine.
-    # ~568M params, ~2.5 GB VRAM in fp16 alongside bge-m3 + Docling + Surya
+    # ~568M params, ~2.5 GB VRAM in fp16 alongside bge-m3 + Docling + RapidOCR
     # — total VRAM stays comfortably under 8 GB so a 12 GB consumer card
     # is enough headroom.
     rerank_model_id: str = "BAAI/bge-reranker-v2-m3"
@@ -124,7 +141,7 @@ class Settings(BaseSettings):
 
     # Skip OCR fallback on regions that are too small to contain meaningful
     # text or are visually empty (solid-color rectangles, decorative borders).
-    # Each skipped region saves ~50-300 ms of Surya OCR work; a typical
+    # Each skipped region saves ~50-300 ms of RapidOCR work; a typical
     # bulk ingest has 5-10 such regions per page.
     ocr_min_region_area_ratio: float = 0.005     # < 0.5% of page area → skip
     ocr_min_pixel_stddev: float = 8.0            # solid-color crops → skip

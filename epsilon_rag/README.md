@@ -9,7 +9,7 @@ runs entirely off your own GPU + Postgres.
                   │                                       │
         ┌─────────▼─────────┐                  ┌──────────▼─────────┐
         │ Docling layout    │                  │ bge-m3 embed       │
-        │ Surya OCR         │                  │  (dense + sparse)  │
+        │ RapidOCR (PP-OCR) │                  │  (dense + sparse)  │
         │ BLIP captions     │                  │ pgvector hybrid    │
         │ pix2text formulas │                  │  retrieval         │
         │ bge-m3 embed      │                  │ weighted RRF       │
@@ -26,7 +26,7 @@ runs entirely off your own GPU + Postgres.
 | Stage | Model / Tool |
 |---|---|
 | Layout / tables / reading order | Docling 2.93 (RT-DETRv2 + TableFormer) |
-| OCR (Arabic + English) | Surya OCR |
+| OCR (Arabic + English) | RapidOCR (PP-OCRv3, ONNX runtime) |
 | Figure captioning | `Salesforce/blip-image-captioning-base` |
 | Formula → LaTeX | `breezedeus/pix2text-mfr` via HF `VisionEncoderDecoderModel` |
 | Embeddings (hybrid) | `BAAI/bge-m3` via FlagEmbedding — 1024-dim dense + sparse over XLM-RoBERTa vocab |
@@ -99,7 +99,7 @@ esplion-rag/
 ├── models/schema.py         # pydantic models the pipeline passes around
 ├── pipeline/
 │   ├── layout.py            # Docling wrapper
-│   ├── ocr.py               # Surya OCR
+│   ├── ocr.py               # RapidOCR (PP-OCRv3 ONNX)
 │   ├── tables.py            # cells → GFM markdown
 │   ├── figures.py           # BLIP captioning
 │   ├── formulas.py          # HF VisionEncoderDecoder

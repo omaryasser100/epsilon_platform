@@ -21,7 +21,7 @@ Usage
 
 Stages
 ======
-  1. Warm up Docling, Surya OCR, formula OCR, figures, bge-m3 embedder
+  1. Warm up Docling, RapidOCR, formula OCR, figures, bge-m3 embedder
      (dense + sparse), bge-reranker-v2-m3 reranker. Loaded ONCE per
      CLI invocation, even in batch mode.
   2. Open the PostgreSQL connection pool.
@@ -61,7 +61,7 @@ def _warmup() -> None:
     started = time.perf_counter()
     for name, fn in [
         ("docling",     layout.init),
-        ("surya",       ocr.init),
+        ("rapidocr",    ocr.init),
         ("pix2tex",     formulas.init),
         ("figures",     figures.init),
         ("embeddings",  embeddings.init),
@@ -149,7 +149,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-ocr", action="store_true",
-        help="Disable Surya OCR fallback on regions without a usable text layer.",
+        help="Disable RapidOCR fallback on regions without a usable text layer.",
     )
     parser.add_argument(
         "--no-captions", action="store_true",

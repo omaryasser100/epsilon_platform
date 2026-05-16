@@ -113,7 +113,7 @@ Gradio  ─PDF upload─▶  backend  ─writes─▶  shared /uploads volume
 ```
 
 The pipeline (`epsilon_rag/`) is the read-only RAG engine: Docling layout
-→ Surya OCR → BLIP figure captions → pix2tex formula recognition →
+→ RapidOCR (PP-OCRv3) → BLIP figure captions → pix2tex formula recognition →
 `bge-m3` hybrid embeddings (dense + sparse) → `pgvector` persistence,
 with weighted RRF + `bge-reranker-v2-m3` cross-encoder at query time.
 

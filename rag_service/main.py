@@ -1,6 +1,6 @@
 """HTTP wrapper around the epsilon_rag library.
 
-On startup the lifespan handler warms every model (Docling, Surya, formulas,
+On startup the lifespan handler warms every model (Docling, RapidOCR, formulas,
 figures, embeddings, reranker) so the first request doesn't pay model-load
 latency. The DB connection pool is opened then and drained on shutdown.
 
@@ -129,10 +129,13 @@ def ingest(req: IngestRequest):
 
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
-    """Run hybrid retrieval and return per-chunk metadata (no content body).
+    """Run hybrid retrieval and return all chunks (primary hits + their
+    ±n neighbour-expansion rows) with full content.
 
-    Neighbour-expansion rows are filtered out; only the primary ranked hits
-    are returned, ordered by rerank score.
+    `result_count` counts only the primary ranked hits — neighbours are
+    context attached to those hits, not separate retrieval results. The
+    full row list lives in `results_metadata`, with `is_neighbour` flags
+    so the caller can group them under their parent.
     """
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
@@ -147,22 +150,26 @@ def query(req: QueryRequest):
         logger.exception("query: retrieval failed for channel %s: %s", req.rag_channel_id, exc)
         raise HTTPException(status_code=500, detail=f"Retrieval error: {exc}")
 
-    primary = [r for r in results if not r.get("is_neighbour")]
     metadata = [
         ResultMetadata(
             report_id=r["report_id"],
             page_number=r["page_number"],
             chunk_index=r["chunk_index"],
+            content=r.get("content") or "",
             rerank_score=r.get("rerank_score"),
             rrf_score=r.get("rrf_score"),
             section_title=(r.get("metadata") or {}).get("section_title", ""),
+            is_neighbour=bool(r.get("is_neighbour", False)),
+            neighbour_of=r.get("neighbour_of"),
         )
-        for r in primary
+        for r in results
     ]
+
+    primary_count = sum(1 for m in metadata if not m.is_neighbour)
 
     return QueryResponse(
         success=True,
-        result_count=len(metadata),
+        result_count=primary_count,
         results_metadata=metadata,
     )
 

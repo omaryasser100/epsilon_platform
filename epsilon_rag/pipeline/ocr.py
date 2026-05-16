@@ -1,4 +1,4 @@
-"""Surya OCR wrapper — Arabic + English text recognition.
+"""RapidOCR wrapper — Arabic + English text recognition via ONNX runtime.
 
 OCR runs only on regions where Docling's text-layer extraction came
 back empty (or suspiciously short). Two reasons:
@@ -6,29 +6,46 @@ back empty (or suspiciously short). Two reasons:
     2. Native PDF text is always more accurate than OCR'd text — never
        overwrite real text with an OCR guess.
 
-Why Surya (and not EasyOCR / PaddleOCR / Tesseract)
-====================================================
-Surya is a transformer-based OCR from Datalab (the team behind Marker
-and Texify). For Arabic-first content it beats the alternatives in
-the dimensions we actually care about:
+Why RapidOCR (and not Surya / EasyOCR / PaddleOCR-Paddle / Tesseract)
+====================================================================
+RapidOCR ships the PaddleOCR PP-OCR family models exported to ONNX,
+with a thin Python wrapper that runs them on onnxruntime instead of
+PaddlePaddle. Three properties matter for our setup:
 
-  - **Cursive ligatures**: Arabic letters change shape based on their
-    position in a word. EasyOCR (CRNN+CTC) was trained on Latin first
-    and bolts on multilingual support; it struggles with the
-    contextual forms common in scanned reports. Surya was trained
-    multilingual from the start.
+  - **CRNN + CTC, not autoregressive**. The recognition head has a
+    "blank" output token, so given a non-text image (e.g. the
+    decorative photo Docling sometimes mis-classifies as a figure
+    region) it can output blank-blank-blank... and produce empty
+    text naturally. Surya (transformer encoder-decoder, autoregressive)
+    can't do that — its decoder is forced to emit *some* token, which
+    is how we ended up with hallucinated repetitions of high-frequency
+    Arabic words flooding every chunk on document-template pages.
 
-  - **RTL bidi**: Surya returns text lines in logical (reading) order
-    for RTL scripts. EasyOCR's `paragraph=True` mode is a heuristic
-    that occasionally orders Arabic columns left-to-right by accident.
+  - **Native confidence scores**. RapidOCR returns a per-line
+    confidence in the result tuple. Hallucinated lines on garbage
+    crops score noticeably lower than real text (~0.2-0.5 vs 0.9+),
+    so a simple threshold filter (`settings.ocr_min_confidence`) wipes
+    them out without a separate "is this gibberish" classifier.
 
-  - **PyTorch-native, transformers-only**: drops in alongside the
-    embedder and reranker without a second deep-learning runtime.
-    PaddleOCR would have meant pulling in paddlepaddle-gpu and
-    juggling a separate CUDA pinning matrix.
+  - **onnxruntime-gpu, no paddlepaddle**. The PP-OCRv3 Arabic weights
+    are state-of-the-art on cursive Arabic ligatures, but we get them
+    without dragging a second deep-learning runtime (PaddlePaddle) into
+    the image. Pure-ONNX runs alongside PyTorch on the same CUDA device
+    without conflict.
 
-  - **HF cache**: weights download into HF_HOME alongside bge-m3
-    etc., so Dockerfile pre-pulls are one cache to warm.
+Model files
+===========
+Three files are required (det + rec + dict). Resolution order at
+init() time:
+
+  1. Explicit override paths from settings.ocr_{det,rec,cls}_model_path
+     and settings.ocr_rec_keys_path.
+  2. `huggingface_hub.hf_hub_download` from `SWHL/RapidOCR` (the
+     canonical, RapidOCR-author-maintained repo of PP-OCR ONNX
+     conversions) into HF_HOME.
+
+The Dockerfile pre-downloads them during the image build so the first
+real ingest doesn't stall on network I/O.
 
 Public API
 ==========
@@ -42,10 +59,9 @@ import io
 import logging
 import threading
 import time
-from typing import Optional
+from pathlib import Path
 
 import numpy as np
-import torch
 from PIL import Image
 
 from core.config import settings
@@ -54,68 +70,145 @@ logger = logging.getLogger(__name__)
 
 
 # ── Module state ────────────────────────────────────────────────────────────
-# Surya's RecognitionPredictor + DetectionPredictor each hold a transformer
-# and a processor. Both are heavy to construct (downloads + load). We build
-# them once at startup and reuse across pages.
+# RapidOCR's engine bundles a detector + recognizer + (optional) angle
+# classifier, each as an ONNX session. Heavy to construct; build once.
 
-_det_predictor = None     # type: ignore[var-annotated]
-_rec_predictor = None     # type: ignore[var-annotated]
-_languages: list[str] = []
+_engine = None             # type: ignore[var-annotated]
 _init_attempted: bool = False
 _lock = threading.Lock()
 
 
-def init() -> None:
-    """Load Surya's detection + recognition predictors. Idempotent.
+# Canonical HF source for the Arabic-tuned PP-OCRv3 ONNX models. These
+# files were converted from PaddleOCR's official .pdmodel / .pdiparams
+# releases by the RapidOCR maintainer. Override via OCR_*_PATH env vars
+# if you have a local mirror or want a different model variant.
+_HF_REPO = "SWHL/RapidOCR"
+_HF_FILES = {
+    "det":  "PP-OCRv3/multilingual/Multilingual_PP-OCRv3_det_infer.onnx",
+    "rec":  "PP-OCRv3/multilingual/arabic_PP-OCRv3_rec_infer.onnx",
+    "keys": "PP-OCRv3/multilingual/arabic_dict.txt",
+    # Orientation classifier — optional. The PP-OCR mobile cls model is
+    # ~1.5 MB and useful when scanned pages have 90/180/270° rotations.
+    # For our PDFs (page rotation already normalised by Docling) it's a
+    # no-op most of the time, but harmless to keep enabled.
+    "cls":  "PP-OCRv3/ch_ppocr_mobile_v2.0_cls_infer.onnx",
+}
 
-    The language list controls which RTL/script behaviour Surya enables
-    per page. It comes from settings.ocr_languages (CSV, default 'ar,en')
-    so adding e.g. Farsi only takes an env var change, no rebuild.
+
+def _resolve_model_paths() -> dict[str, str] | None:
+    """Return {det, rec, keys, cls} → absolute filesystem paths, or None
+    if any required file is missing and cannot be fetched.
+
+    Resolution order per file:
+      1. Explicit override path from settings (set the file directly).
+      2. `huggingface_hub.hf_hub_download` from SWHL/RapidOCR into HF_HOME.
+
+    cls is optional — if unavailable the engine still runs without
+    orientation classification.
     """
-    global _det_predictor, _rec_predictor, _languages, _init_attempted
+    overrides = {
+        "det":  settings.ocr_det_model_path,
+        "rec":  settings.ocr_rec_model_path,
+        "keys": settings.ocr_rec_keys_path,
+        "cls":  settings.ocr_cls_model_path,
+    }
+    paths: dict[str, str] = {}
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        hf_hub_download = None  # type: ignore[assignment]
+
+    for key, override in overrides.items():
+        if override and Path(override).is_file():
+            paths[key] = override
+            continue
+        if hf_hub_download is None:
+            if key == "cls":
+                continue
+            logger.error(
+                "rapidocr: huggingface_hub not installed and OCR_%s_PATH not set",
+                key.upper(),
+            )
+            return None
+        try:
+            paths[key] = hf_hub_download(
+                repo_id=_HF_REPO, filename=_HF_FILES[key],
+            )
+        except Exception as exc:
+            if key == "cls":
+                logger.info(
+                    "rapidocr: cls model unavailable (%s) — running without orientation classifier",
+                    exc,
+                )
+                continue
+            logger.error(
+                "rapidocr: failed to fetch %s from %s/%s: %s",
+                key, _HF_REPO, _HF_FILES[key], exc,
+            )
+            return None
+    return paths
+
+
+def init() -> None:
+    """Load RapidOCR engine + ONNX models. Idempotent.
+
+    On first call: downloads Arabic recognizer + multilingual detector
+    ONNX models from Hugging Face (SWHL/RapidOCR) into HF_HOME if not
+    already cached, then instantiates a RapidOCR session bound to them.
+    """
+    global _engine, _init_attempted
     with _lock:
         if _init_attempted:
             return
         _init_attempted = True
 
         try:
-            from surya.detection import DetectionPredictor
-            from surya.recognition import RecognitionPredictor
+            from rapidocr_onnxruntime import RapidOCR
         except ImportError as exc:
-            logger.exception("surya: package not installed: %s", exc)
+            logger.exception("rapidocr: package not installed: %s", exc)
             return
 
-        _languages = [
-            s.strip() for s in settings.ocr_languages.split(",") if s.strip()
-        ] or ["en"]
-        device = settings.device if torch.cuda.is_available() else "cpu"
+        paths = _resolve_model_paths()
+        if paths is None:
+            logger.error("rapidocr: unable to resolve model paths — OCR disabled")
+            return
+
+        use_cuda = settings.ocr_use_cuda
         logger.info(
-            "surya: initialising languages=%s device=%s", _languages, device,
+            "rapidocr: initialising det=%s rec=%s use_cuda=%s",
+            Path(paths["det"]).name, Path(paths["rec"]).name, use_cuda,
         )
 
         try:
-            # The predictors honour the TORCH_DEVICE env var when they
-            # construct their internal models; setting it here keeps the
-            # rest of the codebase device-agnostic.
-            import os
-            os.environ.setdefault("TORCH_DEVICE", device)
-            _det_predictor = DetectionPredictor()
-            _rec_predictor = RecognitionPredictor()
-            logger.info("surya: ready")
+            kwargs: dict = {
+                "det_model_path": paths["det"],
+                "rec_model_path": paths["rec"],
+                "rec_keys_path":  paths["keys"],
+                "det_use_cuda":   use_cuda,
+                "rec_use_cuda":   use_cuda,
+                "cls_use_cuda":   use_cuda,
+            }
+            if "cls" in paths:
+                kwargs["cls_model_path"] = paths["cls"]
+                kwargs["use_cls"] = True
+            else:
+                kwargs["use_cls"] = False
+            _engine = RapidOCR(**kwargs)
+            logger.info("rapidocr: ready")
         except Exception as exc:
             # Failed loads land us with is_ready() == False; the
             # orchestrator's OCR-fallback path will skip silently and the
             # extracted block just goes empty rather than the page failing.
-            logger.exception("surya: failed to load predictors: %s", exc)
+            logger.exception("rapidocr: failed to load engine: %s", exc)
 
 
 def is_ready() -> bool:
-    return _det_predictor is not None and _rec_predictor is not None
+    return _engine is not None
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
-@torch.inference_mode()
 def ocr_image(img: bytes | np.ndarray | Image.Image) -> str:
     """Run OCR on an image and return concatenated text in reading order.
 
@@ -123,81 +216,88 @@ def ocr_image(img: bytes | np.ndarray | Image.Image) -> str:
     or a PIL Image. Returns "" on any failure — never raises, so the
     orchestrator's fallback path stays predictable.
 
-    For RTL scripts the returned text is in logical (reading) order, so
-    a downstream tokenizer / embedder sees Arabic the same way the
-    author wrote it, not as visual-order glyphs.
+    Line ordering: RapidOCR returns detection boxes top-to-bottom by
+    centroid; within each line, characters are in script-native order
+    (Arabic logical order for AR text, LTR for Latin). Matches what
+    Surya returned, so the orchestrator contract is unchanged.
 
-    Observability: every successful call logs dims + line count + char
-    count + elapsed ms + an 80-char preview. The three silent-failure
-    modes that bit us before (clamped-empty crop, predictor returned
-    no results, lines detected but all empty after strip) each log a
-    distinct WARNING so the next regression is one log line away.
+    Confidence filter: lines below `settings.ocr_min_confidence` are
+    dropped. This is the main defence against the
+    OCR-hallucinating-on-non-text-crops failure mode — well-calibrated
+    PP-OCRv3 confidences make a simple threshold reliable.
+
+    Observability: every successful call logs dims + lines kept + lines
+    dropped + char count + elapsed ms + an 80-char preview. The
+    "detector found nothing" path logs distinctly from "lines detected
+    but all below threshold" so a regression on either is one log line
+    away.
     """
     if not is_ready():
         return ""
 
-    pil = _coerce_to_pil(img)
-    if pil is None:
+    arr = _coerce_to_ndarray(img)
+    if arr is None:
         return ""
 
     started = time.perf_counter()
-    img_w, img_h = pil.size
-    logger.info(
-        "surya: recognizing image=%dx%d langs=%s", img_w, img_h, _languages,
-    )
+    img_h, img_w = arr.shape[:2]
+    logger.info("rapidocr: recognizing image=%dx%d", img_w, img_h)
 
     try:
-        # Surya's recognition takes the detection predictor as an arg so
-        # it knows where to find line boxes. Languages are passed per-
-        # image as a list of lists; we use the same set for every image
-        # since the language hint is just a script-routing signal, not a
-        # filter.
-        predictions = _rec_predictor(
-            [pil], [_languages], _det_predictor,
-        )
-    except torch.cuda.OutOfMemoryError as exc:
-        logger.warning("surya: OOM at image=%dx%d: %s", img_w, img_h, exc)
-        torch.cuda.empty_cache()
-        return ""
+        result, _engine_elapsed = _engine(arr)
     except Exception as exc:
-        logger.warning("surya: recognition failed at image=%dx%d: %s",
+        logger.warning("rapidocr: recognition failed at image=%dx%d: %s",
                        img_w, img_h, exc)
         return ""
 
-    if not predictions:
-        logger.warning("surya: predictor returned no results for image=%dx%d",
-                       img_w, img_h)
-        return ""
-
-    # One image in → one OCRResult out. text_lines is already ordered
-    # top-to-bottom (and right-to-left within RTL rows), so joining on
-    # newlines preserves reading order.
-    page = predictions[0]
-    raw_lines = list(getattr(page, "text_lines", None) or [])
-    lines = []
-    for line in raw_lines:
-        text = (getattr(line, "text", None) or "").strip()
-        if text:
-            lines.append(text)
-
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
-    if not lines:
-        # Distinct from "no predictions": detector saw N candidate
-        # lines but every one stripped to empty. Usually means tiny
-        # crop or a model confidence floor wiped them.
-        logger.warning(
-            "surya: %d line(s) detected but all empty after strip "
-            "(image=%dx%d, elapsed=%dms)",
-            len(raw_lines), img_w, img_h, elapsed_ms,
+    # `result` is None when the detector returned no boxes, or a list
+    # of [bbox, text, score] entries. The "None" path is the natural
+    # "this isn't text" signal a CTC OCR gives us — exactly what Surya
+    # couldn't express because its autoregressive decoder always emits
+    # *some* token.
+    if not result:
+        logger.info(
+            "rapidocr: no text detected (image=%dx%d, elapsed=%dms)",
+            img_w, img_h, elapsed_ms,
         )
         return ""
 
-    out = "\n".join(lines)
+    min_conf = settings.ocr_min_confidence
+    kept: list[str] = []
+    dropped_low_conf = 0
+    for entry in result:
+        # Entry shape is [bbox, text, score] in rapidocr-onnxruntime 1.3.x.
+        # Be defensive about layout in case a future version adds fields.
+        if not entry or len(entry) < 3:
+            continue
+        text = (entry[1] or "").strip()
+        try:
+            score = float(entry[2])
+        except (TypeError, ValueError):
+            score = 0.0
+        if not text:
+            continue
+        if score < min_conf:
+            dropped_low_conf += 1
+            continue
+        kept.append(text)
+
+    if not kept:
+        logger.info(
+            "rapidocr: %d line(s) detected, all below conf=%.2f "
+            "(image=%dx%d, elapsed=%dms)",
+            len(result), min_conf, img_w, img_h, elapsed_ms,
+        )
+        return ""
+
+    out = "\n".join(kept)
     preview = out.replace("\n", " ⏎ ")[:80]
     logger.info(
-        "surya: ok — %d line(s), %d chars, %d ms — preview: %s",
-        len(lines), len(out), elapsed_ms, preview,
+        "rapidocr: ok — %d line(s) kept (%d dropped <%.2f conf), "
+        "%d chars, %d ms — preview: %s",
+        len(kept), dropped_low_conf, min_conf, len(out), elapsed_ms, preview,
     )
     return out
 
@@ -223,7 +323,7 @@ def ocr_crop(
     y0, y1 = max(0, y0), min(page_h, y1)
     crop_w, crop_h = x1 - x0, y1 - y0
     logger.info(
-        "surya: ocr_crop cropping bbox=%s page=%dx%d → crop=%dx%d",
+        "rapidocr: ocr_crop cropping bbox=%s page=%dx%d → crop=%dx%d",
         raw, page_w, page_h, max(0, crop_w), max(0, crop_h),
     )
 
@@ -232,7 +332,7 @@ def ocr_crop(
         # rare. When it still fires, it means upstream geometry is off
         # — log loudly so the source is obvious.
         logger.warning(
-            "surya: ocr_crop bbox clamped to empty "
+            "rapidocr: ocr_crop bbox clamped to empty "
             "(raw=%s page=%dx%d) — upstream bbox / origin / unit mismatch?",
             raw, page_w, page_h,
         )
@@ -244,23 +344,24 @@ def ocr_crop(
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _coerce_to_pil(img: bytes | np.ndarray | Image.Image) -> Image.Image | None:
-    """Normalise the various accepted input forms to a PIL RGB image —
-    Surya's predictors take PIL Images directly."""
-    if isinstance(img, Image.Image):
-        return img.convert("RGB")
+def _coerce_to_ndarray(img: bytes | np.ndarray | Image.Image) -> np.ndarray | None:
+    """Normalise the various accepted input forms to a HxWx3 RGB numpy
+    array — RapidOCR's engine takes a numpy array directly. PIL → np
+    via `np.array(img.convert("RGB"))`."""
     if isinstance(img, np.ndarray):
         if img.ndim not in (2, 3):
             return None
+        return img
+    if isinstance(img, Image.Image):
         try:
-            return Image.fromarray(img).convert("RGB")
+            return np.array(img.convert("RGB"))
         except Exception as exc:
-            logger.warning("surya: failed to convert ndarray: %s", exc)
+            logger.warning("rapidocr: failed to convert PIL image: %s", exc)
             return None
     if isinstance(img, (bytes, bytearray)):
         try:
-            return Image.open(io.BytesIO(img)).convert("RGB")
+            return np.array(Image.open(io.BytesIO(img)).convert("RGB"))
         except Exception as exc:
-            logger.warning("surya: failed to decode image bytes: %s", exc)
+            logger.warning("rapidocr: failed to decode image bytes: %s", exc)
             return None
     return None

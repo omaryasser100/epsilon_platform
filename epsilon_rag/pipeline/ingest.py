@@ -184,43 +184,61 @@ def run_ingest_from_path(
 
     # ── Stage 2: Chunk ────────────────────────────────────────────────────────
     # Pure in-memory — deterministic, no I/O; retry not applicable.
-    pending: list[dict] = []
+    #
+    # Document-level chunking: flatten every page's blocks into one list,
+    # tagging each block with its source `page_number` and a globally-
+    # monotonic `reading_order`. The chunker then walks the whole
+    # document in one pass and decides chunk boundaries by semantics
+    # (heading → body, paragraph fill, atomic table/figure) rather than
+    # by page break. Each emitted chunk carries:
+    #   • `page_number` — the primary citation page (first block's page);
+    #   • `bboxes`      — list of {"page": int, "bbox": [...]} dicts so
+    #                     multi-page chunks can still cite every region;
+    #   • `chunk_index` — globally unique across the report (no longer
+    #                     reset per page; retrieval's neighbour-expansion
+    #                     SQL already orders by (PageNumber, ChunkIndex)
+    #                     so adjacent chunks come back as ±1 neighbours).
+    flat_blocks: list[dict] = []
+    global_order = 0
     for page in extract_response.pages:
         page_num = page.page_number
         if not page_num:
             continue
-        # Thread bbox through to the chunker — it returns `bboxes` per
-        # chunk, which we persist into chunk metadata so the retrieval
-        # layer can produce citation regions on the source page.
-        block_dicts = [
-            {
-                "type":          b.type,
-                "content":       b.content,
-                "reading_order": b.reading_order,
-                "bbox":          b.bbox,
-            }
-            for b in page.blocks
-        ]
-        if block_dicts:
-            for idx, ch in enumerate(chunker.chunk_blocks_with_meta(block_dicts)):
-                pending.append({
+        if page.blocks:
+            for b in page.blocks:
+                if not (b.content or "").strip():
+                    continue
+                flat_blocks.append({
+                    "type":          b.type,
+                    "content":       b.content,
+                    "reading_order": global_order,
+                    "bbox":          b.bbox,
                     "page_number":   page_num,
-                    "chunk_index":   idx,
-                    "content":       ch["content"],
-                    "section_title": ch["section_title"],
-                    "block_types":   ch["block_types"],
-                    "bboxes":        ch.get("bboxes") or [],
                 })
+                global_order += 1
         elif (page.content or "").strip():
-            for idx, piece in enumerate(chunker.chunk_text(page.content)):
-                pending.append({
-                    "page_number":   page_num,
-                    "chunk_index":   idx,
-                    "content":       piece,
-                    "section_title": "",
-                    "block_types":   ["text"],
-                    "bboxes":        [],
-                })
+            # Page has no structured blocks but the extractor gave us
+            # aggregate text — synthesise a single text block so it
+            # still gets chunked alongside the rest of the document.
+            flat_blocks.append({
+                "type":          "text",
+                "content":       page.content,
+                "reading_order": global_order,
+                "bbox":          None,
+                "page_number":   page_num,
+            })
+            global_order += 1
+
+    pending: list[dict] = []
+    for idx, ch in enumerate(chunker.chunk_blocks_with_meta(flat_blocks)):
+        pending.append({
+            "page_number":   int(ch.get("page_number") or 1),
+            "chunk_index":   idx,
+            "content":       ch["content"],
+            "section_title": ch.get("section_title", ""),
+            "block_types":   ch.get("block_types", []),
+            "bboxes":        ch.get("bboxes") or [],
+        })
     logger.info("[ingest %s] chunked → %d chunks", report_id, len(pending))
 
     # ── Stage 3: Embed (dense + sparse, hybrid) ──────────────────────────────
@@ -269,10 +287,12 @@ def run_ingest_from_path(
                 metadata = {
                     "section_title": p["section_title"],
                     "block_types":   p["block_types"],
-                    # `bboxes` is a list of 4-tuples (x_min, y_min, x_max, y_max)
-                    # on the rendered page (top-left origin, pixel-space at
-                    # the orchestrator's _RENDER_DPI = 150). Lets the UI
-                    # / answer layer draw citation regions on the source.
+                    # `bboxes` is a list of `{"page": int, "bbox": [x_min,
+                    # y_min, x_max, y_max]}` dicts — one per contributing
+                    # block. The bbox is top-left origin, pixel-space at
+                    # the orchestrator's _RENDER_DPI = 150. The per-bbox
+                    # page lets the UI / answer layer render citation
+                    # regions for chunks that span page boundaries.
                     "bboxes":        p.get("bboxes") or [],
                     "language":      language,
                     "extractor":     extractor_tag,

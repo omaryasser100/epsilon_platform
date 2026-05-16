@@ -184,22 +184,58 @@ def _err_msg(exc: Exception) -> str:
     return f"Error: {exc}"
 
 
+def _as_blockquote(text: str) -> str:
+    """Wrap multi-line text as a Markdown blockquote so chunk content
+    renders as a distinct block inside the chat bubble. Empty lines are
+    kept as `>` so the quote doesn't break visually mid-chunk."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return "\n".join(f"> {line}" if line else ">" for line in text.split("\n"))
+
+
 def format_query_response(result: dict) -> str:
-    """Render a /orchestrate?action=query response as Markdown for the chat."""
+    """Render a /orchestrate?action=query response as Markdown for the chat.
+
+    Renders each primary hit's full chunk content followed by its ±n
+    neighbour-expansion rows (indented as "context"). `result_count` is
+    the primary-hit count, not the total row count.
+    """
     if not result.get("success"):
         return f"Query failed: {result.get('message', 'Unknown error.')}"
 
     count = result.get("result_count", 0)
-    if count == 0:
+    rows = result.get("results_metadata", []) or []
+    if count == 0 or not rows:
         return "No relevant results found for your question."
 
-    lines = [f"Found **{count}** relevant result(s):\n"]
-    for i, r in enumerate(result.get("results_metadata", []), 1):
+    lines: list[str] = [f"Found **{count}** relevant result(s):"]
+    primary_idx = 0
+    for r in rows:
+        content = (r.get("content") or "").strip()
+        if r.get("is_neighbour"):
+            # Neighbour rows attach to the most recent primary above.
+            lines.append("")
+            lines.append(
+                f"   ↳ *Context — Page {r['page_number']}, chunk {r['chunk_index']}*"
+            )
+            if content:
+                lines.append(_as_blockquote(content))
+            continue
+
+        primary_idx += 1
         score = r.get("rerank_score") if r.get("rerank_score") is not None else r.get("rrf_score")
         score_str = f"{score:.3f}" if score is not None else "N/A"
         section = (r.get("section_title") or "").strip()
         section_part = f" | Section: *{section}*" if section else ""
-        lines.append(f"**{i}.** Page {r['page_number']}{section_part} | Score: {score_str}")
+        lines.append("")
+        lines.append("---")
+        lines.append(
+            f"**{primary_idx}.** Page {r['page_number']}{section_part} | Score: {score_str}"
+        )
+        if content:
+            lines.append("")
+            lines.append(_as_blockquote(content))
 
     return "\n".join(lines)
 

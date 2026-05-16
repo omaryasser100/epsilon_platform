@@ -131,7 +131,7 @@ def _region_area_ratio(region, page_img: np.ndarray | None) -> float:
 
 
 def _region_worth_ocring(region, page_img: np.ndarray | None) -> bool:
-    """Cheap pre-flight before invoking Surya OCR on a region crop.
+    """Cheap pre-flight before invoking RapidOCR on a region crop.
 
     Two gates, both ~microseconds:
       1. Area: skip regions smaller than `ocr_min_region_area_ratio` of
@@ -187,7 +187,7 @@ def _process_region(
         # to cut bulk-ingest wallclock): skip the OCR call when the region
         # is too small to plausibly contain text, or when the crop is
         # effectively a solid color (decorative border, page margin). Each
-        # skipped call saves ~50-300 ms of Surya OCR work.
+        # skipped call saves ~50-300 ms of RapidOCR work.
         if (options.ocr_fallback
                 and len(text) < settings.ocr_fallback_min_chars
                 and _region_worth_ocring(region, page_img)):

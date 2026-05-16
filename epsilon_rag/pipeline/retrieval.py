@@ -135,18 +135,42 @@ FROM fused
 JOIN report_chunks rc ON rc."Id" = fused.id
 """
 
-# Neighbour chunks (chunk_index ± n) for a given report. Fetched in one
-# round-trip after retrieval ranks the parents. ChannelId is in the
-# WHERE clause defensively so a bad parent row can't leak into the wrong
-# tenant's data.
+# Neighbour chunks for a given report, in *reading order* (pos ± n).
+#
+# Why we can't just filter on `ChunkIndex BETWEEN lo AND hi`:
+# `ChunkIndex` is reset to 0 on every page during ingest (see
+# pipeline/ingest.py — chunk_index is per-page, not per-report). Doing a
+# ±n filter on `ChunkIndex` alone returns rows from completely unrelated
+# pages that happen to share that numeric index. The bug surfaced as
+# "page 5 has page 3 as its neighbour" and as most results showing no
+# neighbours at all (parent chunk_indices collided in the dedup set).
+#
+# Fix: compute a global per-report ordering at query time via
+# ROW_NUMBER() OVER (PARTITION BY ReportId ORDER BY PageNumber,
+# ChunkIndex). That ordering is the natural reading sequence, so ± n on
+# `pos` gives "the n chunks before and after this one in the document".
+#
+# ChannelId is in the WHERE clause defensively so a bad parent row can't
+# leak into the wrong tenant's data.
 _NEIGHBOURS_SQL = """
-SELECT "Id", "ChannelId", "ReportId", "PageNumber", "ChunkIndex",
-       "Content", metadata
-FROM report_chunks
-WHERE "ChannelId" = %(channel_id)s
-  AND "ReportId"  = %(report_id)s
-  AND "ChunkIndex" BETWEEN %(lo)s AND %(hi)s
-ORDER BY "ChunkIndex" ASC
+WITH ordered AS (
+    SELECT "Id", "ChannelId", "ReportId", "PageNumber", "ChunkIndex",
+           "Content", metadata,
+           ROW_NUMBER() OVER (ORDER BY "PageNumber", "ChunkIndex") AS pos
+    FROM report_chunks
+    WHERE "ChannelId" = %(channel_id)s
+      AND "ReportId"  = %(report_id)s
+),
+parent_window AS (
+    SELECT MIN(pos) - %(n)s AS lo, MAX(pos) + %(n)s AS hi
+    FROM ordered
+    WHERE "Id" = ANY(%(parent_ids)s::uuid[])
+)
+SELECT o."Id", o."ChannelId", o."ReportId", o."PageNumber", o."ChunkIndex",
+       o."Content", o.metadata, o.pos
+FROM ordered o, parent_window w
+WHERE o.pos BETWEEN w.lo AND w.hi
+ORDER BY o.pos ASC
 """
 
 
@@ -389,9 +413,10 @@ def _attach_neighbours(
     channel_id: str,
     n: int,
 ) -> list[dict[str, Any]]:
-    """Fetch chunk_index ± n for every result row, dedupe against the
-    original results, and slot them in next to their parent. Parents
-    retain their order; neighbours sort by chunk_index inside each group.
+    """Fetch the ±n chunks around every result in document reading order,
+    dedupe against the other parents, and slot them in next to their
+    parent. Parents retain their RRF/rerank order; neighbours appear
+    immediately before and after each parent in `pos` order.
 
     Uses one round-trip per (report_id) bucket — typically just a handful
     of bucket queries even when top_k is large.
@@ -400,7 +425,10 @@ def _attach_neighbours(
         return rows
 
     # Group result rows by report_id; mark each as the "anchor" so we
-    # don't refetch its own row as a neighbour.
+    # don't refetch its own row as a neighbour. Dedup is by chunk Id
+    # (UUID) because chunk_index is per-page and not unique within a
+    # report — using it for dedup was what made most neighbours
+    # disappear under the previous implementation.
     by_report: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         row.setdefault("is_neighbour", False)
@@ -410,36 +438,52 @@ def _attach_neighbours(
     final: list[dict[str, Any]] = []
     with get_conn() as conn:
         for report_id, parents in by_report.items():
-            anchor_indices = {p["chunk_index"] for p in parents}
-            lo = max(0, min(p["chunk_index"] for p in parents) - n)
-            hi = max(p["chunk_index"] for p in parents) + n
+            anchor_ids = {str(p["id"]) for p in parents}
+            parent_ids = [str(p["id"]) for p in parents]
+
             cur = conn.execute(
                 _NEIGHBOURS_SQL,
-                {"channel_id": channel_id,
-                 "report_id":  report_id,
-                 "lo": lo, "hi": hi},
+                {
+                    "channel_id": channel_id,
+                    "report_id":  report_id,
+                    "parent_ids": parent_ids,
+                    "n":          n,
+                },
             )
             cols = [desc[0] for desc in cur.description]
             window = [dict(zip(cols, r)) for r in cur.fetchall()]
 
-            # Map chunk_index → row for fast lookup.
-            by_idx = {int(r["ChunkIndex"]): r for r in window}
+            # Map global `pos` → row for ±n lookup, and resolve each
+            # parent's own `pos` so we can build its window relative to
+            # the report's reading order (not the per-page chunk_index).
+            by_pos = {int(r["pos"]): r for r in window}
+            parent_pos: dict[str, int] = {}
+            for r in window:
+                rid = str(r["Id"])
+                if rid in anchor_ids:
+                    parent_pos[rid] = int(r["pos"])
 
-            # Interleave: for each parent, prepend N before and append N
-            # after, but skip rows that are themselves anchors (don't
-            # duplicate). Keeps original parent order.
+            # Interleave: for each parent (in their original ranked order),
+            # prepend N rows before and append N rows after — skipping any
+            # row that is itself one of the ranked parents.
             for parent in parents:
-                center = parent["chunk_index"]
-                # Before — ascending idx ending right before the parent.
+                center = parent_pos.get(str(parent["id"]))
+                if center is None:
+                    # Parent row wasn't visible inside its own report's
+                    # ordering — shouldn't happen, but degrade gracefully.
+                    final.append(parent)
+                    continue
+
+                # Before — ascending pos ending right before the parent.
                 for off in range(n, 0, -1):
-                    cand = by_idx.get(center - off)
-                    if cand and int(cand["ChunkIndex"]) not in anchor_indices:
+                    cand = by_pos.get(center - off)
+                    if cand and str(cand["Id"]) not in anchor_ids:
                         final.append(_neighbour_dict(cand, parent["id"]))
                 final.append(parent)
-                # After — ascending idx starting right after the parent.
+                # After — ascending pos starting right after the parent.
                 for off in range(1, n + 1):
-                    cand = by_idx.get(center + off)
-                    if cand and int(cand["ChunkIndex"]) not in anchor_indices:
+                    cand = by_pos.get(center + off)
+                    if cand and str(cand["Id"]) not in anchor_ids:
                         final.append(_neighbour_dict(cand, parent["id"]))
 
     return final

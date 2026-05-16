@@ -36,9 +36,19 @@ class ResultMetadata(BaseModel):
     report_id: str
     page_number: int
     chunk_index: int
+    # Full chunk text — surfaced so the chat layer can render the actual
+    # retrieved passages, not just bookkeeping. Neighbour-expansion rows
+    # carry their own content here too.
+    content: str = ""
     rerank_score: Optional[float] = None
     rrf_score: Optional[float] = None
     section_title: str = ""
+    # Neighbour-expansion bookkeeping. `is_neighbour=True` means the row
+    # is a ±n context chunk attached to one of the primary hits, not a
+    # ranked retrieval result. `neighbour_of` carries the parent chunk's
+    # id so the UI can group neighbours under their parent.
+    is_neighbour: bool = False
+    neighbour_of: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
