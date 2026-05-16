@@ -1,0 +1,121 @@
+# Compose for the local doc-processor stack.
+#
+# Brings up PostgreSQL + pgvector, MinIO, and a one-shot `migrate` job.
+# Python CLIs can run on the host (GPU) or inside the optional `app`
+# service (`--profile gpu`).
+#
+# Usage:
+#     cp .env.example .env
+#     docker compose up -d                    # postgres + minio + migrate
+#     python scripts/migrate.py               # host-only (if migrate skipped)
+#     python main.py "..." --channel-id ...   # ingest on host
+#
+#     docker compose --profile gpu run --rm app main.py /data/doc.pdf --channel-id <uuid>
+#     docker compose --profile gpu run --rm app query.py "..." --channel-id <uuid>
+#
+# Override anything via .env (copy .env.example → .env first).
+
+x-migrate-build: &migrate-build
+  context: .
+  dockerfile: Dockerfile.migrate
+
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile.gpu
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-rag_db}
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  MINIO_BUCKET: ${MINIO_BUCKET:-epsilon-rag}
+  MINIO_BUCKET_PREFIX: ${MINIO_BUCKET_PREFIX:-channels}
+  MINIO_USE_SSL: "false"
+  HF_HOME: /app/.hf-cache
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    # The container name doubles as the network alias and the value the
+    # CLIs see in `docker ps`. Pinning it makes the bootstrap commands
+    # in the README quotable.
+    container_name: ${POSTGRES_CONTAINER_NAME:-rag-pgvec}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB:       ${POSTGRES_DB:-rag_db}
+    ports:
+      # Bind to localhost only by default — change to 0.0.0.0:5432 in
+      # .env (POSTGRES_BIND) if you need to reach the DB from another
+      # machine on the network.
+      - "${POSTGRES_BIND:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Named volume so the data survives `docker compose down`. Wipe
+      # state with `docker compose down -v` when iterating on schema.
+      - pgvec_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    # S3-compatible object store. The bucket (epsilon-rag by default) and
+    # the per-channel raw/markdown/metadata prefixes are created lazily in
+    # Python by core.storage.ensure_bucket() on first ingest — no `mc`
+    # bootstrap service needed.
+    image: minio/minio:latest
+    container_name: ${MINIO_CONTAINER_NAME:-rag-minio}
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  migrate:
+    # One-shot schema bootstrap. Re-runs on every `compose up` but
+    # scripts/migrate.py is idempotent (no-ops when already applied).
+    build: *migrate-build
+    image: doc-processor:migrate
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    # Optional GPU CLI — not started by default. Override ENTRYPOINT via
+    # `docker compose run` args, e.g. `... run --rm app main.py /data/x.pdf`.
+    profiles: ["gpu"]
+    build: *app-build
+    image: doc-processor:gpu
+    entrypoint: ["python"]
+    command: ["--help"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment: *app-env
+    volumes:
+      - hf_cache:/app/.hf-cache
+      - ${PDF_HOST_DIR:-./data}:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+
+volumes:
+  pgvec_data:
+  minio_data:
+  hf_cache:

@@ -1,0 +1,76 @@
+# ── Core ─────────────────────────────────────────────────────────────────────
+pydantic-settings==2.6.1
+pillow==10.4.0
+
+# ── PyTorch (CUDA 12.1 wheels) ───────────────────────────────────────────────
+# Pin minor versions; the Hugging Face / Docling stack is sensitive to
+# torch/transformers compatibility.
+# surya-ocr ≥0.10 requires torch>=2.5.1 (DetectionPredictor API used by
+# pipeline/ocr.py).
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+
+# ── Document AI stack ────────────────────────────────────────────────────────
+# Docling = layout detection + reading order + table structure (TableFormer).
+# Bundles DocLayNet weights and TableFormer; no extra downloads.
+docling==2.93.0
+
+# transformers / accelerate / timm / einops — required by docling 2.93's
+# layout (RT-DETRv2) and table (TableFormer) models.
+#   transformers 4.50: AutoModelForImageTextToText (docling chart pipeline)
+#                       + rt_detr_v2 model type (docling layout model)
+#   accelerate 1.4:    required by docling-ibm-models 3.13.x (>=1.2.1)
+transformers==4.50.0
+accelerate==1.4.0
+einops==0.8.0
+timm==1.0.11
+
+# Surya OCR — transformer-based OCR from Datalab. Replaces EasyOCR
+# (CRNN+CTC, ~2019-era) — Surya handles cursive Arabic ligatures and
+# RTL bidi correctly, and uses the same `transformers` install we
+# already need for everything else (no paddlepaddle CUDA pinning).
+# Weights download from HF on first use into HF_HOME.
+# 0.6.x exposes a flat `surya.detection` module without DetectionPredictor;
+# 0.10.x matches `pipeline/ocr.py` (DetectionPredictor + RecognitionPredictor).
+surya-ocr==0.10.3
+
+# FlagEmbedding — gives us BGEM3FlagModel, the only loader that exposes
+# bge-m3's lexical (sparse) head in addition to the 1024-dim dense head.
+# Used by pipeline/embeddings.py to produce hybrid (dense + sparse)
+# chunk vectors.
+FlagEmbedding==1.2.10
+
+# sentence-transformers — kept for the cross-encoder reranker
+# (BAAI/bge-reranker-v2-m3) in pipeline/reranker.py. The dense embedder
+# has moved off this library; see FlagEmbedding above.
+sentence-transformers==3.2.1
+
+# Formula OCR is optional — VisionEncoderDecoderModel from HF when
+# FORMULAS_MODEL_ID is set (see pipeline/formulas.py). Default is off
+# because breezedeus/pix2text-mfr is ONNX-only on HF.
+#
+# Figure captioning runs BLIP from the same `transformers` package
+# (see pipeline/figures.py).
+
+# ── Image / PDF support ──────────────────────────────────────────────────────
+pymupdf==1.24.14
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# ── Chunking (used by the ingest pipeline) ───────────────────────────────────
+# RecursiveCharacterTextSplitter — page text → chunk-sized strings.
+langchain-text-splitters==0.3.2
+
+# ── Database + vector persistence (used by pipeline/ingest.py) ───────────────
+# Chunks + 1024-dim vectors persist to a local pgvector PostgreSQL.
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.3
+pgvector==0.3.6
+
+# ── Object storage (used by core/storage.py) ─────────────────────────────────
+# Official MinIO SDK — used to persist raw PDFs, extracted markdown, and
+# per-document metadata JSON under <bucket>/<prefix>/<channel_id>/...
+# S3-compatible, so this same client also talks to AWS S3 if MINIO_ENDPOINT
+# is repointed there.
+minio==7.2.10

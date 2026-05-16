@@ -1,0 +1,22 @@
+# Lightweight image for scripts/migrate.py only (no CUDA / ML stack).
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+RUN pip install --upgrade pip \
+    && pip install \
+        "psycopg[binary]==3.2.3" \
+        "psycopg-pool==3.2.3" \
+        "pgvector==0.3.6" \
+        "pydantic-settings==2.6.1"
+
+COPY core/ core/
+COPY migrations/ migrations/
+COPY scripts/migrate.py scripts/migrate.py
+
+ENTRYPOINT ["python", "scripts/migrate.py"]

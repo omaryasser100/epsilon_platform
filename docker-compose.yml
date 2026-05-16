@@ -1,0 +1,83 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: epsilon_postgres
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init_control.sql:/docker-entrypoint-initdb.d/01_init_control.sql
+      - ./db/init_rag.sql:/docker-entrypoint-initdb.d/02_init_rag.sql
+
+  minio:
+    image: minio/minio
+    container_name: epsilon_minio
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: epsilon_backend
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads_data:/uploads
+    depends_on:
+      - postgres
+
+  rag_service:
+    build:
+      context: .
+      dockerfile: Dockerfile.rag
+    container_name: epsilon_rag_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - MINIO_ENDPOINT=minio:9000
+    volumes:
+      - uploads_data:/uploads
+    depends_on:
+      - postgres
+      - minio
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: epsilon_frontend
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "7860:7860"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  minio_data:
+  uploads_data:

@@ -1,0 +1,19 @@
+# Git history — large and never needed inside containers
+.git
+epsilon_rag/.git
+
+# Python cache
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+**/*.pyc
+
+# Local env file — injected at runtime via docker-compose env_file
+.env
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo

@@ -1,0 +1,90 @@
+# GPU-enabled document processing CLI image.
+#
+# Stack:
+#   • Docling             — layout, reading order, tables (TableFormer)
+#   • Surya OCR           — Arabic + English text recognition
+#   • BAAI/bge-m3         — multilingual chunk embeddings (1024-dim)
+#   • BAAI/bge-reranker-v2-m3 — cross-encoder reranker
+#
+# The container runs `python main.py <pdf>` as its entrypoint — bind-mount
+# the PDF in and pass --report-id / other flags via `docker run` args.
+# Connects to a PostgreSQL+pgvector instance via $DATABASE_URL (the
+# default in core/config.py points at a host-side `rag-pgvec` container,
+# so use a docker network or override the env when invoking).
+
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+# Install build tools and pip-install everything into a venv. The venv is what
+# we copy across to the runtime stage, so its layout is self-contained and
+# doesn't depend on Debian's site-packages vs dist-packages quirks.
+FROM nvidia/cuda:12.1.0-base-ubuntu22.04 AS builder
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3-pip \
+        build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build everything inside /opt/venv so the runtime stage gets a single,
+# self-contained tree to copy. No PYTHONPATH gymnastics needed.
+RUN python3.11 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --upgrade pip setuptools wheel
+
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+# Minimal CUDA base — PyTorch bundles its own cuDNN, so we don't need the
+# OS-level cudnn8-runtime layer (saves ~1.5 GB vs the previous base image).
+# Only OpenCV runtime libs and Python are needed here.
+FROM nvidia/cuda:12.1.0-base-ubuntu22.04 AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    TRANSFORMERS_OFFLINE=0 \
+    HF_HOME=/app/.hf-cache \
+    PATH="/opt/venv/bin:$PATH"
+
+# python3.11 (no pip, no venv tooling) + OpenCV runtime libs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the venv from the builder. Because PATH starts with /opt/venv/bin, every
+# `python` / `pip` call resolves to the venv and finds the installed packages
+# automatically — no PYTHONPATH overrides needed.
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+
+# Pre-download model weights so the first run only pays for VRAM transfer,
+# not network I/O. snapshot_download fetches files only; the actual model
+# init (which needs a real CUDA driver) happens when main.py runs.
+#
+# Surya OCR pulls from HF cache too (HF_HOME), so the same `snapshot_download`
+# trick works — no separate cache directory like EasyOCR used. The repo IDs
+# below match what Surya's DetectionPredictor / RecognitionPredictor load
+# by default; pin them via SURYA_DETECTOR_MODEL / SURYA_RECOGNITION_MODEL
+# at runtime if you need a different version.
+RUN python -c "from huggingface_hub import snapshot_download; \
+    snapshot_download(repo_id='BAAI/bge-m3'); \
+    snapshot_download(repo_id='BAAI/bge-reranker-v2-m3'); \
+    snapshot_download(repo_id='vikp/surya_det3'); \
+    snapshot_download(repo_id='vikp/surya_rec2')"
+
+COPY . .
+
+# `python main.py <pdf>` — pass the PDF path and any flags as `docker run`
+# args. Example:
+#     docker run --gpus all --network host \
+#                -v /host/pdfs:/data taqreerk-doc-processor /data/report.pdf
+ENTRYPOINT ["python", "main.py"]

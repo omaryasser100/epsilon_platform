@@ -1,0 +1,41 @@
+fastapi
+uvicorn
+
+# ── Core ─────────────────────────────────────────────────────────────────────
+pydantic-settings==2.6.1
+pillow==10.4.0
+
+# ── PyTorch (CUDA 12.1 wheels) ───────────────────────────────────────────────
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+
+# ── Document AI stack ────────────────────────────────────────────────────────
+docling==2.93.0
+transformers==4.50.0
+accelerate==1.4.0
+einops==0.8.0
+timm==1.0.11
+
+# ── OCR ──────────────────────────────────────────────────────────────────────
+surya-ocr==0.10.3
+
+# ── Embeddings + reranker ─────────────────────────────────────────────────────
+FlagEmbedding==1.2.10
+sentence-transformers==3.2.1
+
+# ── Image / PDF support ──────────────────────────────────────────────────────
+pymupdf==1.24.14
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# ── Chunking ─────────────────────────────────────────────────────────────────
+langchain-text-splitters==0.3.2
+
+# ── Database + vector persistence ────────────────────────────────────────────
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.3
+pgvector==0.3.6
+
+# ── Object storage ───────────────────────────────────────────────────────────
+minio==7.2.10
