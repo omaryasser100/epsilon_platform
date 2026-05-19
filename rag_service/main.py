@@ -22,6 +22,8 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from langfuse import Langfuse
+from langfuse.decorators import langfuse_context, observe
 
 # epsilon_rag is on PYTHONPATH (set in Dockerfile.rag) so these imports
 # resolve directly against /app/epsilon_rag.
@@ -51,9 +53,33 @@ logging.basicConfig(
 logger = logging.getLogger("rag_service")
 
 
+# ── Langfuse client ──────────────────────────────────────────────────────────
+# Instantiated lazily on first use via the SDK's env-var driven singleton.
+# When LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are unset (e.g. fresh boot
+# before the user has created a project in the UI) every @observe and
+# update_current_observation call short-circuits to a no-op, so the rag
+# service still answers requests with no Langfuse stack at all.
+_langfuse: Langfuse | None = None
+
+
+def _init_langfuse() -> Langfuse | None:
+    if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
+        logger.info("langfuse: keys not set — tracing disabled (set LANGFUSE_PUBLIC_KEY/SECRET_KEY in .env to enable)")
+        return None
+    client = Langfuse(
+        public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
+        secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
+        host=os.getenv("LANGFUSE_HOST", "http://langfuse_web:3000"),
+    )
+    logger.info("langfuse: client ready (host=%s)", os.getenv("LANGFUSE_HOST"))
+    return client
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _langfuse
     init_pool()
+    _langfuse = _init_langfuse()
     started = time.perf_counter()
     for name, fn in [
         ("layout",     layout.init),
@@ -74,6 +100,13 @@ async def lifespan(app: FastAPI):
             logger.exception("warmup: %s failed — service will degrade: %s", name, exc)
     logger.info("warmup: total %.1fs", time.perf_counter() - started)
     yield
+    # Drain the background event queue so the last few traces of a session
+    # actually land in Langfuse before the worker exits.
+    if _langfuse is not None:
+        try:
+            _langfuse.flush()
+        except Exception as exc:
+            logger.warning("langfuse: flush on shutdown failed: %s", exc)
     close_pool()
 
 
@@ -86,9 +119,26 @@ def health():
 
 
 @app.post("/ingest", response_model=IngestResponse)
+@observe(name="rag.ingest")
 def ingest(req: IngestRequest):
     """Upsert a report row and run the full extract → chunk → embed → persist
     pipeline against the file at req.file_path (on the shared uploads volume)."""
+    # Tag the trace up-front so even a 4xx (file-missing) call is visible
+    # in Langfuse with the channel + filename attached. user_id and
+    # session_id come from the backend orchestrator (forwarded from the
+    # JWT) so traces can be filtered by user and grouped by login session.
+    langfuse_context.update_current_trace(
+        name="rag.ingest",
+        tags=["ingest"],
+        user_id=req.user_id,
+        session_id=req.session_id,
+        metadata={
+            "rag_channel_id": req.rag_channel_id,
+            "filename":       req.filename,
+            "file_path":      req.file_path,
+        },
+    )
+
     if not os.path.isfile(req.file_path):
         raise HTTPException(status_code=400, detail=f"File not found at path: {req.file_path}")
 
@@ -104,6 +154,8 @@ def ingest(req: IngestRequest):
         logger.exception("ingest: failed to upsert report: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to create report record: {exc}")
 
+    langfuse_context.update_current_observation(metadata={"report_id": report_id})
+
     try:
         stats = run_ingest_from_path(
             req.rag_channel_id,
@@ -114,6 +166,18 @@ def ingest(req: IngestRequest):
     except Exception as exc:
         logger.exception("ingest: pipeline failed for report %s: %s", report_id, exc)
         raise HTTPException(status_code=500, detail=f"Ingest pipeline error: {exc}")
+
+    langfuse_context.update_current_observation(
+        output={
+            "report_id":        report_id,
+            "pages_processed":  stats["pages_processed"],
+            "pages_total":      stats["pages_total"],
+            "chunks_inserted":  stats["chunks_inserted"],
+            "extractor":        stats["extractor"],
+            "embed_model":      stats["embed_model"],
+            "total_latency_ms": stats["total_latency_ms"],
+        },
+    )
 
     return IngestResponse(
         success=True,
@@ -128,6 +192,7 @@ def ingest(req: IngestRequest):
 
 
 @app.post("/query", response_model=QueryResponse)
+@observe(name="rag.query")
 def query(req: QueryRequest):
     """Run hybrid retrieval and return all chunks (primary hits + their
     ±n neighbour-expansion rows) with full content.
@@ -137,6 +202,20 @@ def query(req: QueryRequest):
     full row list lives in `results_metadata`, with `is_neighbour` flags
     so the caller can group them under their parent.
     """
+    # Attach trace-level context so a query can be grouped by tenant in
+    # the UI and the raw user question shows as the trace input.
+    # user_id + session_id come from the JWT via the backend orchestrator;
+    # they let Langfuse group all queries from one login as a session and
+    # filter the trace list by username.
+    langfuse_context.update_current_trace(
+        name="rag.query",
+        tags=["query"],
+        user_id=req.user_id,
+        session_id=req.session_id,
+        input={"question": req.question, "top_k": req.top_k},
+        metadata={"rag_channel_id": req.rag_channel_id},
+    )
+
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
@@ -166,6 +245,24 @@ def query(req: QueryRequest):
     ]
 
     primary_count = sum(1 for m in metadata if not m.is_neighbour)
+
+    # Surface a small per-trace output payload — top page numbers + scores
+    # — so traces are scannable in the UI without expanding every span.
+    langfuse_context.update_current_observation(
+        output={
+            "result_count":   primary_count,
+            "neighbour_rows": len(metadata) - primary_count,
+            "top_hits": [
+                {
+                    "page":         m.page_number,
+                    "chunk_index":  m.chunk_index,
+                    "rerank_score": m.rerank_score,
+                    "rrf_score":    m.rrf_score,
+                }
+                for m in metadata if not m.is_neighbour
+            ][:5],
+        },
+    )
 
     return QueryResponse(
         success=True,

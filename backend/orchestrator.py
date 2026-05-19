@@ -61,6 +61,12 @@ def _query(user_session: dict, payload: dict) -> dict:
             json={
                 "rag_channel_id": user_session["rag_channel_id"],
                 "question": question,
+                # Forwarded to Langfuse as trace tags. `username` over
+                # `userid` because the UI is more useful with the human
+                # name; the numeric id is in metadata. `session_id` is
+                # the JWT session — one login → one Langfuse session.
+                "user_id":    user_session.get("username"),
+                "session_id": user_session.get("session_id"),
             },
             timeout=60,
         )
@@ -113,6 +119,9 @@ def _ingest(user_session: dict, payload: dict) -> dict:
                 "filename": filename,
                 "title": payload.get("title", ""),
                 "metadata": payload.get("metadata", {}),
+                # Trace tags — see _query for rationale.
+                "user_id":    user_session.get("username"),
+                "session_id": user_session.get("session_id"),
             },
             timeout=600,
         )

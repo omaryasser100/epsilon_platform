@@ -11,6 +11,11 @@ class IngestRequest(BaseModel):
     filename: str
     title: str = ""
     metadata: Optional[dict[str, Any]] = None
+    # Optional observability fields — forwarded by the backend orchestrator
+    # from the caller's JWT. Used only for Langfuse trace tagging; the
+    # ingest pipeline itself ignores them.
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class IngestResponse(BaseModel):
@@ -30,6 +35,10 @@ class QueryRequest(BaseModel):
     rag_channel_id: str
     question: str
     top_k: int = 10
+    # Optional observability fields — forwarded by the backend orchestrator
+    # from the caller's JWT. Used only for Langfuse trace tagging.
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class ResultMetadata(BaseModel):

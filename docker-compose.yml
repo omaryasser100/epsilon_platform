@@ -77,7 +77,138 @@ services:
     depends_on:
       - backend
 
+  # ── Langfuse (self-hosted observability) ──────────────────────────────────
+  # Five containers, all hidden from the host network except langfuse-web on
+  # :3000 (the UI). They share the project's MinIO for blob storage but use
+  # a dedicated Postgres so a `docker compose down -v` on the RAG stack
+  # doesn't blow away trace history (or vice versa).
+
+  langfuse_postgres:
+    image: postgres:16
+    container_name: epsilon_langfuse_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: epsilon_clickhouse
+    restart: always
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  redis:
+    image: redis:7
+    container_name: epsilon_redis
+    restart: always
+    command: --requirepass redis
+
+  # One-shot init: create the `langfuse` bucket in MinIO before the
+  # Langfuse containers come up. `mb --ignore-existing` is idempotent —
+  # safe to re-run on every `docker compose up`. Unlike the rag pipeline
+  # (which calls ensure_bucket from Python on each ingest), Langfuse v3
+  # assumes the bucket is pre-provisioned, so without this sidecar every
+  # event upload fails with "The specified bucket does not exist".
+  minio_init:
+    image: minio/mc
+    container_name: epsilon_minio_init
+    depends_on:
+      - minio
+    entrypoint: >
+      sh -c "
+        until mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}; do
+          echo 'waiting for minio...'; sleep 2;
+        done;
+        mc mb --ignore-existing minio/langfuse;
+        mc mb --ignore-existing minio/${MINIO_BUCKET};
+        echo 'minio_init: buckets ready';
+      "
+    restart: "no"
+
+  langfuse_worker:
+    image: langfuse/langfuse-worker:3
+    container_name: epsilon_langfuse_worker
+    restart: always
+    depends_on:
+      - langfuse_postgres
+      - clickhouse
+      - redis
+      - minio
+      - minio_init
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse_postgres:5432/langfuse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: redis
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "false"
+
+  langfuse_web:
+    image: langfuse/langfuse:3
+    container_name: epsilon_langfuse_web
+    restart: always
+    depends_on:
+      - langfuse_postgres
+      - clickhouse
+      - redis
+      - minio
+      - minio_init
+      - langfuse_worker
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse_postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: redis
+      TELEMETRY_ENABLED: "false"
+
 volumes:
   postgres_data:
   minio_data:
   uploads_data:
+  langfuse_postgres_data:
+  clickhouse_data:
+  clickhouse_logs:

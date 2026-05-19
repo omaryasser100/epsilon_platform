@@ -43,3 +43,8 @@ pgvector==0.3.6
 
 # ── Object storage ───────────────────────────────────────────────────────────
 minio==7.2.10
+
+# ── Observability (Langfuse) ─────────────────────────────────────────────────
+# v2 decorator API. Run as no-op when LANGFUSE_PUBLIC_KEY is unset, so the
+# pipeline still works against a stack without the Langfuse containers up.
+langfuse>=2.60,<3.0

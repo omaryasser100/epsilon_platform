@@ -54,9 +54,11 @@ A list of dicts:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import numpy as np
+from langfuse.decorators import langfuse_context, observe
 from pgvector.psycopg import SparseVector
 
 from core.config import settings
@@ -176,6 +178,7 @@ ORDER BY o.pos ASC
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+@observe(name="hybrid_query", as_type="retriever")
 def hybrid_query(
     text: str,
     channel_id: str,
@@ -230,9 +233,11 @@ def hybrid_query(
     if rerank:
         fused_limit = max(fused_limit, top_k * 3)
 
+    t_embed = time.perf_counter()
     dense_list, sparse_list = embeddings.embed([text], kind="query")
     if not dense_list or not sparse_list:
         raise RuntimeError("query embedding returned empty result")
+    embed_ms = int((time.perf_counter() - t_embed) * 1000)
 
     dense_vec = np.array(dense_list[0], dtype=np.float32)
     sparse_vec = SparseVector(sparse_list[0], settings.embed_sparse_dim)
@@ -255,10 +260,21 @@ def hybrid_query(
                     "(beta=%.2f, top_n=%d)", prf_beta, prf_topn,
                 )
 
+    t_sql = time.perf_counter()
     rows = _run_hybrid_sql(
         dense_vec, sparse_vec, candidates, channel_id, report_id,
     )
+    sql_ms = int((time.perf_counter() - t_sql) * 1000)
     if not rows:
+        langfuse_context.update_current_observation(
+            input={"query": text, "channel_id": channel_id, "top_k": top_k},
+            output=[],
+            metadata={
+                "embed_ms": embed_ms,
+                "sql_ms":   sql_ms,
+                "candidates_returned": 0,
+            },
+        )
         return []
 
     # ── Weighted RRF over the union ─────────────────────────────────
@@ -268,28 +284,65 @@ def hybrid_query(
         row["rrf_score"] = _weighted_rrf(dense_rank, sparse_rank, alpha, rrf_k)
     rows.sort(key=lambda r: r["rrf_score"], reverse=True)
     rows = rows[:fused_limit]
+    fused_count = len(rows)
 
     # ── Optional cross-encoder rerank ────────────────────────────────
+    t_rerank = time.perf_counter()
     if rerank:
         rows = _rerank(text, rows, top_k=top_k)
     else:
         rows = rows[:top_k]
         for row in rows:
             row["rerank_score"] = None
+    rerank_ms = int((time.perf_counter() - t_rerank) * 1000)
 
     # ── Optional neighbour expansion ─────────────────────────────────
+    t_neigh = time.perf_counter()
     if neighbours > 0:
         rows = _attach_neighbours(rows, channel_id, neighbours)
+    neighbours_ms = int((time.perf_counter() - t_neigh) * 1000)
 
     # Strip the internal _embedding before returning. PRF needs it
     # during the first pass; everything after that just carries it.
     for row in rows:
         row.pop("_embedding", None)
+
+    # Per-trace summary — gives a per-stage latency breakdown and the top
+    # scores without dumping every chunk's full content into the trace.
+    langfuse_context.update_current_observation(
+        input={"query": text, "channel_id": channel_id, "top_k": top_k},
+        output=[
+            {
+                "report_id":    r["report_id"],
+                "page_number":  r["page_number"],
+                "chunk_index":  r["chunk_index"],
+                "rrf_score":    r.get("rrf_score"),
+                "rerank_score": r.get("rerank_score"),
+                "is_neighbour": r.get("is_neighbour", False),
+            }
+            for r in rows
+        ],
+        metadata={
+            "embed_ms":          embed_ms,
+            "sql_ms":            sql_ms,
+            "rerank_ms":         rerank_ms,
+            "neighbours_ms":     neighbours_ms,
+            "fused_pool":        fused_count,
+            "alpha":             alpha,
+            "rrf_k":             rrf_k,
+            "candidates":        candidates,
+            "prf_beta":          prf_beta,
+            "neighbours":        neighbours,
+            "rerank_enabled":    rerank,
+            "report_filter":     report_id,
+        },
+    )
     return rows
 
 
 # ── SQL execution ───────────────────────────────────────────────────────────
 
+@observe(name="hybrid_sql")
 def _run_hybrid_sql(
     dense_vec: np.ndarray,
     sparse_vec: SparseVector,
@@ -372,6 +425,7 @@ def _renormalise(vec: np.ndarray) -> np.ndarray:
 
 # ── Reranker ────────────────────────────────────────────────────────────────
 
+@observe(name="rerank")
 def _rerank(
     text: str,
     rows: list[dict[str, Any]],
@@ -408,6 +462,7 @@ def _rerank(
 
 # ── Neighbour expansion ─────────────────────────────────────────────────────
 
+@observe(name="attach_neighbours")
 def _attach_neighbours(
     rows: list[dict[str, Any]],
     channel_id: str,

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
+from langfuse.decorators import langfuse_context, observe
 
 from core import storage
 from core.config import settings
@@ -82,6 +83,7 @@ def _retry(fn, stage: str, report_id: str):
     raise last_exc  # unreachable but satisfies type-checkers
 
 
+@observe(name="run_ingest_from_path")
 def run_ingest_from_path(
     channel_id: str,
     report_id: str,
@@ -108,6 +110,10 @@ def run_ingest_from_path(
     )
 
     overall_started = time.perf_counter()
+    # Per-stage timings populated as we walk the pipeline. Surfaced to
+    # Langfuse at the end so the trace shows where time actually went
+    # without us needing to decorate every helper.
+    stage_ms: dict[str, int] = {}
 
     # ── Stage 0: Object storage (MinIO) — upload raw PDF ─────────────────────
     # Done early so the source survives even if a later stage fails. Re-runs
@@ -115,6 +121,7 @@ def run_ingest_from_path(
     # report_id, filename) so a retry overwrites in place rather than
     # accumulating orphans. Markdown + metadata follow at stages 1.5 and 5.
     minio_cfg = settings.minio_config()
+    t_stage = time.perf_counter()
     _retry(
         lambda: storage.ensure_bucket(minio_cfg),
         "minio_ensure_bucket", report_id,
@@ -129,6 +136,7 @@ def run_ingest_from_path(
         ),
         "minio_upload_raw", report_id,
     )
+    stage_ms["upload_raw_ms"] = int((time.perf_counter() - t_stage) * 1000)
     logger.info(
         "[ingest %s] uploaded raw PDF → s3://%s/%s",
         report_id, minio_cfg.bucket, raw_key,
@@ -142,10 +150,12 @@ def run_ingest_from_path(
         ocr_fallback=options.ocr_fallback,
         figure_captioning=options.figure_captioning,
     )
+    t_stage = time.perf_counter()
     extract_response = _retry(
         lambda: process_document(pdf_bytes, extract_options, None),
         "extract", report_id,
     )
+    stage_ms["extract_ms"] = int((time.perf_counter() - t_stage) * 1000)
     pages_total   = extract_response.document_metadata.page_count
     extractor_tag = extract_response.extractor
     languages     = extract_response.document_metadata.detected_languages
@@ -167,6 +177,7 @@ def run_ingest_from_path(
     markdown_key  = storage.object_key(
         minio_cfg, channel_id, "markdown", f"{report_id}.md",
     )
+    t_stage = time.perf_counter()
     _retry(
         lambda: storage.safe_put(
             minio_cfg,
@@ -176,6 +187,7 @@ def run_ingest_from_path(
         ),
         "minio_upload_markdown", report_id,
     )
+    stage_ms["upload_markdown_ms"] = int((time.perf_counter() - t_stage) * 1000)
     logger.info(
         "[ingest %s] uploaded markdown (%d chars, %d bytes) → s3://%s/%s",
         report_id, len(markdown_text), len(markdown_blob),
@@ -198,6 +210,7 @@ def run_ingest_from_path(
     #                     reset per page; retrieval's neighbour-expansion
     #                     SQL already orders by (PageNumber, ChunkIndex)
     #                     so adjacent chunks come back as ±1 neighbours).
+    t_stage = time.perf_counter()
     flat_blocks: list[dict] = []
     global_order = 0
     for page in extract_response.pages:
@@ -239,11 +252,13 @@ def run_ingest_from_path(
             "block_types":   ch.get("block_types", []),
             "bboxes":        ch.get("bboxes") or [],
         })
+    stage_ms["chunk_ms"] = int((time.perf_counter() - t_stage) * 1000)
     logger.info("[ingest %s] chunked → %d chunks", report_id, len(pending))
 
     # ── Stage 3: Embed (dense + sparse, hybrid) ──────────────────────────────
     dense_vectors: list[list[float]] = []
     sparse_vectors: list[dict[int, float]] = []
+    t_stage = time.perf_counter()
     if pending:
         if not embeddings.is_ready():
             raise RuntimeError(
@@ -258,6 +273,7 @@ def run_ingest_from_path(
                 f"embedder returned dense={len(dense_vectors)} sparse="
                 f"{len(sparse_vectors)} vectors for {len(pending)} chunks"
             )
+    stage_ms["embed_ms"] = int((time.perf_counter() - t_stage) * 1000)
     logger.info(
         "[ingest %s] embedded %d chunks (model=%s, dim_dense=%d, dim_sparse=%d)",
         report_id, len(dense_vectors), settings.embed_model_id,
@@ -319,7 +335,9 @@ def run_ingest_from_path(
             conn.commit()
         return deleted
 
+    t_stage = time.perf_counter()
     deleted = _retry(_persist, "persist", report_id)
+    stage_ms["persist_ms"] = int((time.perf_counter() - t_stage) * 1000)
 
     pages_with_chunks = len({p["page_number"] for p in pending})
     total_ms = int((time.perf_counter() - overall_started) * 1000)
@@ -370,13 +388,44 @@ def run_ingest_from_path(
     metadata_key = storage.object_key(
         minio_cfg, channel_id, "metadata", f"{report_id}.json",
     )
+    t_stage = time.perf_counter()
     _retry(
         lambda: storage.put_json(minio_cfg, metadata_key, metadata_payload),
         "minio_upload_metadata", report_id,
     )
+    stage_ms["upload_metadata_ms"] = int((time.perf_counter() - t_stage) * 1000)
     logger.info(
         "[ingest %s] uploaded metadata → s3://%s/%s",
         report_id, minio_cfg.bucket, metadata_key,
+    )
+
+    # ── Surface the full per-stage breakdown to Langfuse ─────────────────
+    # Done at the very end so partial failures don't poison the trace with
+    # half-set timings; on success the parent span shows every stage in
+    # one glance with chunk counts and the extractor used.
+    langfuse_context.update_current_observation(
+        input={
+            "channel_id": channel_id,
+            "report_id":  report_id,
+            "filename":   path.name,
+            "size_bytes": len(pdf_bytes),
+        },
+        output={
+            "pages_processed":  pages_with_chunks,
+            "pages_total":      pages_total,
+            "chunks_inserted":  len(pending),
+            "extractor":        extractor_tag,
+            "language":         language,
+            "total_latency_ms": total_ms,
+        },
+        metadata={
+            **stage_ms,
+            "embed_model":      settings.embed_model_id,
+            "embed_dim":        (len(dense_vectors[0]) if dense_vectors else 0),
+            "embed_sparse_dim": settings.embed_sparse_dim,
+            "content_sha256":   metadata_payload["content_sha256"],
+            "chunks_deleted":   deleted,
+        },
     )
 
     return {
